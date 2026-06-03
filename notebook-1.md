@@ -1,4 +1,4 @@
-# CS336 Assignment 1
+# CS336 Assignment 1: 学习笔记
 
 ## 目录
 
@@ -8,8 +8,9 @@
   - [1.2 Byte-level BPE vs 经典 BPE](#12-byte-level-bpe-vs-经典-bpe)
   - [1.3 词表(Vocabulary)](#13-词表vocabulary)
   - [1.4 Pre-tokenization](#14-pre-tokenization)
-  - [1.5 pre-token 的数据表示:`tuple[bytes, ...]`](#15-pre-token-的数据表示)
-  - [1.6 训练性能优化:增量更新](#16-训练性能优化增量更新)
+  - [1.5 单轮 BPE 训练的输入输出](#15-单轮-bpe-训练的输入输出)
+  - [1.6 pre-token 的数据表示:`tuple[bytes, ...]`](#16-pre-token-的数据表示)
+  - [1.7 训练性能优化:增量更新](#17-训练性能优化增量更新)
 - **Part 2: Tokenizer 编解码**
   - [2.1 Tokenizer 类的三个反向索引](#21-tokenizer-类的三个反向索引)
   - [2.2 encode 算法](#22-encode-算法)
@@ -367,7 +368,208 @@ pre-token 频次表(几百万条记录,**压缩了几个量级**)
 
 ---
 
-## 1.5 pre-token 的数据表示
+## 1.5 单轮 BPE 训练的输入输出
+
+把每一步的输入输出、变量类型、形状摊开。用 handout 玩具例子(`low/lower/widest/newest`)走一遍。
+
+### 训练的"状态变量"先列清楚
+
+整个 `train_bpe` 函数维护这些状态:
+
+| 变量 | 类型 | 含义 | 何时建 / 改 |
+|---|---|---|---|
+| `pre_token_freq` | `dict[tuple[bytes, ...], int]` | pre-token → 出现次数 | Step 3 建,Step 5 每轮改 |
+| `vocab` | `dict[int, bytes]` | token id → token bytes | 初始 256+special,每轮 +1 |
+| `merges` | `list[tuple[bytes, bytes]]` | 已学到的合并规则,**按学习顺序** | 每轮 append 1 个 |
+| `pair_freq`(优化版) | `Counter[(bytes, bytes), int]` | pair → 加权频次 | Step 5.1 建,Step 5.4 增量改 |
+
+### 各步骤的输入 / 输出 / 形状
+
+#### Step 1:特殊 token 切块
+
+- **输入**:`input_path: str`(几十 GB),`special_tokens: list[str]`
+- **做的事**:按 `<|endoftext|>` 切块,**保证 BPE 不跨边界**
+- **输出**:`list[str]` —— 每段是 special token 之间的文本(special token 本身丢掉)
+
+```
+输入: "low low<|endoftext|>widest newest"
+输出: ["low low", "widest newest"]
+```
+
+#### Step 2:pre-tokenization
+
+- **输入**:`list[str]`(上一步的 chunks)
+- **做的事**:对每块用 GPT-2 `PAT` 正则 `re.finditer` **流式**切 pre-tokens
+- **输出**:**`str` 迭代器**(不落地,省内存)
+
+```
+输入: "low low low lower lower widest..."
+输出 (流): "low", " low", " low", ..., " lower", " widest", ...
+```
+
+#### Step 3 + 4:**str → tuple[bytes,...] + 频次表**
+
+代码里这两步一气呵成:
+
+```python
+for m in re.finditer(PAT, sub_chunk):
+    pre_token_freq[_to_byte_tuple(m.group())] += 1
+```
+
+- **输入**:Step 2 的 `str` 流
+- **做的事**:
+  1. 每个 `str` 经 `_to_byte_tuple` 转成 `tuple[bytes, ...]`,每个元素是**单字节 bytes**
+  2. 用 dict 累加频次
+- **输出**:`pre_token_freq: dict[tuple[bytes, ...], int]`
+
+handout 玩具例子最终长这样:
+
+```python
+pre_token_freq = {
+    (b'l', b'o', b'w'):                            5,
+    (b'l', b'o', b'w', b'e', b'r'):                2,
+    (b'w', b'i', b'd', b'e', b's', b't'):          3,
+    (b'n', b'e', b'w', b'e', b's', b't'):          6,
+}
+```
+
+**形状感觉**:
+- dict 大小:几百万条(真实语料)
+- 每个 key 是一个 tuple,长度 = pre-token 的字节数
+- 每个 value 是 int
+
+### Step 5:**BPE 训练主循环**
+
+进入主循环前,先初始化:
+
+```python
+vocab = {i: bytes([i]) for i in range(256)}       # 0~255 → b'\x00'~b'\xff'
+for k, st in enumerate(special_tokens):
+    vocab[256 + k] = st.encode("utf-8")            # 256 → b'<|endoftext|>'
+merges = []
+# 此时 len(vocab) = 257
+```
+
+然后循环:
+
+```python
+while len(vocab) < vocab_size:
+    ...
+```
+
+每一轮做 **4 件事**:
+
+#### 5.1 统计相邻 pair 加权频次
+
+- **输入**:`pre_token_freq`
+- **做的事**:遍历每个 pre-token,看相邻 pair,按 pre-token 频次累加
+- **输出**:`pair_freq: Counter[(bytes, bytes), int]`
+
+handout 玩具 Round 1 初始状态:
+
+```
+对 (b'l', b'o', b'w'), freq=5: pair (l,o) += 5, pair (o,w) += 5
+对 (b'l', b'o', b'w', b'e', b'r'), freq=2: pair (l,o) += 2, (o,w) += 2, (w,e) += 2, (e,r) += 2
+对 (b'w', b'i', b'd', b'e', b's', b't'), freq=3: pair (w,i)+=3, (i,d)+=3, (d,e)+=3, (e,s)+=3, (s,t)+=3
+对 (b'n', b'e', b'w', b'e', b's', b't'), freq=6: pair (n,e)+=6, (e,w)+=6, (w,e)+=6, (e,s)+=6, (s,t)+=6
+
+→ pair_freq = {
+    (b'l',b'o'): 7,  (b'o',b'w'): 7,
+    (b'w',b'e'): 8,  (b'e',b'r'): 2,
+    (b'w',b'i'): 3,  (b'i',b'd'): 3, (b'd',b'e'): 3,
+    (b'e',b's'): 9,  (b's',b't'): 9,
+    (b'n',b'e'): 6,  (b'e',b'w'): 6,
+}
+```
+
+#### 5.2 找最频繁的 pair(同频取 lex 较大)
+
+- **输入**:`pair_freq`
+- **做的事**:`max(pair_freq.items(), key=lambda kv: (kv[1], kv[0]))`
+  - 主排序键:频次(大的赢)
+  - 次排序键:pair 本身的 bytes(大的赢,lex 比较)
+- **输出**:`best_pair: tuple[bytes, bytes]`
+
+```
+最高频次是 9:(b'e', b's') 和 (b's', b't') 平手
+lex 比较: (b'e', b's') < (b's', b't')   ← 因为 b'e' < b's'
+取较大的 → best_pair = (b's', b't')
+```
+
+#### 5.3 更新 vocab 和 merges
+
+- **输入**:`best_pair`
+- **做的事**:
+  ```python
+  new_token = best_pair[0] + best_pair[1]    # bytes 拼接:b's' + b't' = b'st'
+  vocab[len(vocab)] = new_token              # 257 → b'st'
+  merges.append(best_pair)                   # [(b's', b't')]
+  ```
+- **输出**:`vocab` 大小 +1,`merges` 长度 +1
+
+#### 5.4 把 best_pair 在所有 pre-token 里合并
+
+- **输入**:`pre_token_freq`, `best_pair=(b's', b't')`
+- **做的事**:扫所有 pre-token,把相邻的 `(b's', b't')` 替换成 `b'st'`(**1 个 2 字节元素**)
+- **输出**:`pre_token_freq` 更新
+
+```
+合并前:
+  (b'l', b'o', b'w'):                     5     ← 没 (s,t),不动
+  (b'l', b'o', b'w', b'e', b'r'):         2     ← 没 (s,t),不动
+  (b'w', b'i', b'd', b'e', b's', b't'):   3     ← 有!
+  (b'n', b'e', b'w', b'e', b's', b't'):   6     ← 有!
+
+合并后:
+  (b'l', b'o', b'w'):                     5
+  (b'l', b'o', b'w', b'e', b'r'):         2
+  (b'w', b'i', b'd', b'e', b'st'):        3     ← 元素从 6 个变 5 个
+  (b'n', b'e', b'w', b'e', b'st'):        6
+```
+
+**关键变化**:tuple 里的元素不再都是单字节。`b'st'` 是 2 字节的 bytes,每个元素仍然是 "**当前 vocab 里的某个 token**"。
+
+### "vocab 达标"是什么意思
+
+`vocab_size` 是 `train_bpe` 的 **目标参数**:
+
+| 场景 | vocab_size |
+|---|---|
+| 课程小测试(corpus.en) | 500 |
+| TinyStories 实战 | 10,000 |
+| OpenWebText 实战 | 32,000 |
+| GPT-2 生产 | ~50,257 |
+
+主循环用这个判断:
+
+```python
+while len(vocab) < vocab_size:    # ← "vocab 达标" 判断
+    ...
+```
+
+**"vocab 达标" = `len(vocab) == vocab_size`**,while 条件不成立,退出。
+
+**要做多少轮?** 每轮 vocab +1。初始大小 = `256 + len(special_tokens)`:
+
+```
+轮数 = vocab_size - 256 - len(special_tokens)
+```
+
+- `vocab_size=500`,1 个 special → 做 `500 - 256 - 1 = 243` 轮
+- `vocab_size=10000`,1 个 special → 做 `9743` 轮
+
+**特殊情况:`pair_freq` 为空**
+
+```python
+if not pair_freq:
+    break
+```
+
+当所有 pre-token 都被合并成 1 个元素了(`len(pre_token) == 1`),就没有相邻 pair。语料太小或太单一时会触发,vocab 没达标也提前退出。
+
+---
+
+## 1.6 pre-token 的数据表示
 
 数据结构是 `dict[tuple[bytes, ...], int]`,把每个独立 pre-token 用一个 `tuple` 存。这个设计是 BPE 实现的核心。
 
@@ -421,7 +623,7 @@ pre-token 频次表(几百万条记录,**压缩了几个量级**)
 
 ---
 
-## 1.6 训练性能优化:增量更新
+## 1.7 训练性能优化:增量更新
 
 ### 问题:朴素 BPE 主循环 O(num_merges × N)
 
