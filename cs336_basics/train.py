@@ -1,8 +1,12 @@
 # train.py
 
 import argparse
+import math
+from dataclasses import asdict, dataclass
+
 import numpy as np
 import torch
+import wandb
 from cs336_basics.nn import (
     TransformerLM, AdamW, cross_entropy, softmax,
     gradient_clipping, learning_rate_schedule,
@@ -10,12 +14,74 @@ from cs336_basics.nn import (
 )
 from cs336_basics.tokenizer import Tokenizer
 
-def main(args):
-    # 1. 加载数据（用 memmap 内存高效加载）
-    train_data = np.memmap(args.train_data, dtype=np.uint16, mode='r')
-    val_data   = np.memmap(args.val_data,   dtype=np.uint16, mode='r')
 
-    # 2. 建模型
+@dataclass
+class TrainConfig:
+    train_data: str
+    val_data: str
+    vocab_size: int
+    context_length: int
+    d_model: int
+    num_layers: int
+    num_heads: int
+    d_ff: int
+    rope_theta: float
+    lr: float
+    lr_min: float
+    weight_decay: float
+    grad_clip: float
+    batch_size: int
+    max_steps: int
+    warmup_steps: int
+    log_interval: int
+    eval_interval: int
+    eval_batches: int
+    save_interval: int
+    out_dir: str
+    device: str
+    wandb: bool
+    wandb_project: str
+    wandb_run_name: str | None
+    wandb_entity: str | None
+
+
+def init_wandb(args: TrainConfig) -> None:
+    if not args.wandb:
+        return
+    wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        entity=args.wandb_entity,
+        config=asdict(args),
+    )
+
+
+def loss_to_perplexity(loss: float) -> float:
+    return math.exp(min(loss, 20.0))
+
+
+def eval_model(
+    model: torch.nn.Module,
+    val_data: np.memmap,
+    args: TrainConfig,
+) -> float:
+    model.eval()
+    losses: list[float] = []
+    with torch.no_grad():
+        for _ in range(args.eval_batches):
+            xv, yv = get_batch(val_data, args.batch_size, args.context_length, args.device)
+            val_logits = model(xv)
+            losses.append(
+                cross_entropy(val_logits.view(-1, args.vocab_size), yv.view(-1)).item()
+            )
+    model.train()
+    return sum(losses) / len(losses)
+
+
+def main(args: TrainConfig):
+    train_data = np.memmap(args.train_data, dtype=np.uint16, mode='r')
+    val_data = np.memmap(args.val_data, dtype=np.uint16, mode='r')
+
     model = TransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -24,55 +90,61 @@ def main(args):
         num_heads=args.num_heads,
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
+        device=args.device,
     )
 
-    # 3. 建 optimizer
+    init_wandb(args)
+
     optimizer = AdamW(model.parameters(), lr=args.lr,
                       weight_decay=args.weight_decay)
 
-    # 4. 训练循环
-    for step in range(args.max_steps):
-        # 学习率调度
-        lr = learning_rate_schedule(step, args.lr, args.lr_min,
-                                    args.warmup_steps, args.max_steps)
-        for g in optimizer.param_groups:
-            g['lr'] = lr
+    try:
+        for step in range(args.max_steps):
+            lr = learning_rate_schedule(
+                step, args.lr, args.lr_min, args.warmup_steps, args.max_steps
+            )
+            for g in optimizer.param_groups:
+                g['lr'] = lr
 
-        # 取 batch
-        x, y = get_batch(train_data, args.batch_size,
-                         args.context_length, args.device)
+            x, y = get_batch(train_data, args.batch_size,
+                             args.context_length, args.device)
 
-        # forward + loss
-        optimizer.zero_grad()
-        logits = model(x)                           # (batch, seq, vocab)
-        loss = cross_entropy(logits.view(-1, args.vocab_size), y.view(-1))
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = cross_entropy(logits.view(-1, args.vocab_size), y.view(-1))
+            loss.backward()
+            gradient_clipping(model.parameters(), args.grad_clip)
+            optimizer.step()
 
-        # backward
-        loss.backward()
+            train_loss = loss.item()
+            train_ppl = loss_to_perplexity(train_loss)
+            metrics: dict[str, float] = {}
 
-        # gradient clipping
-        gradient_clipping(model.parameters(), args.grad_clip)
+            if step % args.log_interval == 0:
+                metrics.update({
+                    "train/loss": train_loss,
+                    "train/ppl": train_ppl,
+                    "lr": lr,
+                })
+                print(f"step {step}: train_loss={train_loss:.4f}, train_ppl={train_ppl:.1f}, lr={lr:.6f}")
 
-        # optimizer step
-        optimizer.step()
+            if step % args.eval_interval == 0:
+                val_loss = eval_model(model, val_data, args)
+                val_ppl = loss_to_perplexity(val_loss)
+                metrics.update({
+                    "val/loss": val_loss,
+                    "val/ppl": val_ppl,
+                })
+                print(f"step {step}: val_loss={val_loss:.4f}, val_ppl={val_ppl:.1f}")
 
-        # 打印 log
-        if step % args.log_interval == 0:
-            print(f"step {step}: train_loss={loss.item():.4f}, lr={lr:.6f}")
+            if args.wandb and metrics:
+                wandb.log(metrics, step=step)
 
-        # 验证集 loss
-        if step % args.eval_interval == 0:
-            with torch.no_grad():
-                xv, yv = get_batch(val_data, args.batch_size,
-                                   args.context_length, args.device)
-                val_logits = model(xv)
-                val_loss = cross_entropy(val_logits.view(-1, args.vocab_size), yv.view(-1))
-            print(f"step {step}: val_loss={val_loss.item():.4f}")
-
-        # 保存 checkpoint
-        if step % args.save_interval == 0 and step > 0:
-            save_checkpoint(model, optimizer, step,
-                           f"{args.out_dir}/ckpt_{step}.pt")
+            if step % args.save_interval == 0 and step > 0:
+                save_checkpoint(model, optimizer, step, f"{args.out_dir}/ckpt_{step}.pt")
+    finally:
+        if args.wandb:
+            wandb.finish()
 
 def decode(
     model: torch.nn.Module,
@@ -82,6 +154,7 @@ def decode(
     temperature: float = 1.0,
     top_p: float = 1.0,
     device: str = "cpu",
+    context_length: int | None = None,
 ) -> str:
     model.eval()
     token_ids = tokenizer.encode(prompt)
@@ -90,7 +163,10 @@ def decode(
 
     with torch.no_grad():
         for _ in range(max_tokens):
-            logits = model(ids)          # (1, seq, vocab)
+            model_input = ids
+            if context_length is not None and model_input.shape[1] > context_length:
+                model_input = model_input[:, -context_length:]
+            logits = model(model_input)          # (1, seq, vocab)
             logits = logits[0, -1, :]    # (vocab,) 只取最后一个位置
 
             # temperature scaling
@@ -143,8 +219,42 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--log_interval",  type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=100)
+    parser.add_argument("--eval_batches", type=int, default=10,
+                        help="Number of val batches to average for val/loss")
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument("--out_dir",    type=str, default="checkpoints")
     parser.add_argument("--device",     type=str, default="cpu")
-    args = parser.parse_args()
-    main(args)
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log metrics to Weights & Biases (use --no-wandb to disable)")
+    parser.add_argument("--wandb_project", type=str, default="cs336-assignment1")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    ns = parser.parse_args()
+    main(TrainConfig(
+        train_data=ns.train_data,
+        val_data=ns.val_data,
+        vocab_size=ns.vocab_size,
+        context_length=ns.context_length,
+        d_model=ns.d_model,
+        num_layers=ns.num_layers,
+        num_heads=ns.num_heads,
+        d_ff=ns.d_ff,
+        rope_theta=ns.rope_theta,
+        lr=ns.lr,
+        lr_min=ns.lr_min,
+        weight_decay=ns.weight_decay,
+        grad_clip=ns.grad_clip,
+        batch_size=ns.batch_size,
+        max_steps=ns.max_steps,
+        warmup_steps=ns.warmup_steps,
+        log_interval=ns.log_interval,
+        eval_interval=ns.eval_interval,
+        eval_batches=ns.eval_batches,
+        save_interval=ns.save_interval,
+        out_dir=ns.out_dir,
+        device=ns.device,
+        wandb=ns.wandb,
+        wandb_project=ns.wandb_project,
+        wandb_run_name=ns.wandb_run_name,
+        wandb_entity=ns.wandb_entity,
+    ))
