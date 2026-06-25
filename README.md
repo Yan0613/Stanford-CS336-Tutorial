@@ -48,3 +48,20 @@ gunzip owt_valid.txt.gz
 cd ..
 ```
 
+## results
+### generated text
+```
+>   --checkpoint checkpoints/ckpt_19500.pt \
+>   --prompt "Once upon a time, there was a little rabbit" \
+>   --max-tokens 150 \
+>   --temperature 0.8 \
+>   --top-p 0.9 \
+>   --device cuda
+Loaded checkpoint from step 19500
+Once upon a time, there was a little rabbit. The rabbit was very sorry because he did not have any friends. He was always scared and would often cry.
+One day, the rabbit went to a big field. In the field, he saw a squirrel. The squirrel was eating some oats. The rabbit wanted to play with the squirrel. So, the rabbit ran up to the squirrel and said, "Hi, squirrel! Do you want to play with me?"
+The squirrel was surprised and happy. He said, "Yes, I want to play with you!" They played all day in the field. The rabbit learned to be more careful with oats. The squirrel and the squirrel became good friends. They played together every day and had lots of fun.
+```
+### train log
+![loss](./assets/loss.png)
+
